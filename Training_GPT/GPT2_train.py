@@ -181,7 +181,12 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-    
+# --------------------------------------------------------------------------
+# prefix tokens
+import tiktoken # type: ignore
+
+
+
 # --------------------------------------------------------------------------
 # attempt to autodetect the device used 
 device = 'cpu'
@@ -200,8 +205,7 @@ model = GPT(GPTConfig())
 # model.eval()
 model.to(device)
 
-# prefix tokens
-import tiktoken # type: ignore
+
 
 # get a data batch 
 enc = tiktoken.get_encoding('gpt2')
@@ -211,7 +215,9 @@ text = text[:1000]
 tokens = enc.encode(text)
 B, T = 4, 32
 # Creates the sequence for the tokens we want + 1
-buf = torch.tensor(tokens[:B+T + 1])
+buf = torch.tensor(tokens[:B*T + 1])
+# for tensors you have to make it go through the device 
+buf = buf.to(device)
 # Everything but the plus 1
 x = buf[:-1].view(B,T)
 # Everything except the first one 
@@ -221,9 +227,24 @@ y = buf[1:].view(B, T)
 # buf = torch.tensor(tokens[:24+1])
 # x = bug[:-1].view(4,6)
 # y = buf[1:].view(4,6)
+
+
 # get logits 
-logits, loss = model(x, y)
-print(loss)
+# logits, loss = model(x, y)
+# print(loss)
+
+# this learnign rate is a good rate 
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+# Let's overfit to a single batch 
+for i in range(50):
+    # always remember to 0 your gradient 
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    # step updates the parameters to decrease the loss
+    optimizer.step()
+    # when we call .item and ships it back to the cpu that is turned into a float 
+    print(f"step {i}, loss {loss.item()}")
 
 # Let's skip the end for now
 import sys; sys.exit(0) 
