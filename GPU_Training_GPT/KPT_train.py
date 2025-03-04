@@ -1,171 +1,137 @@
-from dataclasses import dataclass 
-import torch 
-import torch.nn as nn 
-from torch.nn import functional as F 
-import math 
-# -------------------------------------------------------------------
-# Now we write the Attention Module 
+import math
+from dataclasses import dataclass
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+# -----------------------------------------------------------------------------
+
 class CausalSelfAttention(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch 
+        # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
-        # output projeciton 
+        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INT = 1
-        # regularization 
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+        # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
-        # not really a 'bias', more of a mask, but following hte OpenAI/HF naming though
-        self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size)).view(1,1,config.block_size, config.block_size))
-        
+        # not really a 'bias', more of a mask, but following the OpenAI/HF naming though
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                     .view(1, 1, config.block_size, config.block_size))
+
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality
-        # calculate query, key, values for all heads in batch and move head forward to be the batch
-        # nh is "number of heads", hs is "head size" and C (number of channels) = nh * hs
-        # e.g in GPT-2 (124M), n_head = 12, hs=64, nh*hs=C=768 channels in the Transformer
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # nh is "number of heads", hs is "head size", and C (number of channels) = nh * hs
+        # e.g. in GPT-2 (124M), n_head=12, hs=64, so nh*hs=C=768 channels in the Transformer
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        
-        ######################## Normal but slower attention
-        # attention (materializes the large (T,T) matrix for all the queries and keys)
-        # att = (q @ k.transpose(-2,-1)) * (1.0/math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        # att = F.softmax(att, dim=-1)
-        # y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        ##########################
-        # Flash attention 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        
-        # This is a concatenation expression 
-        y = y.transpose(1,2).contiguous().view(B,T,C)
-        # output projection 
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        # output projection
         y = self.c_proj(y)
-        return y 
+        return y
 
-
-# Very simple MLP that puts the input dimension into 4 times the size
 class MLP(nn.Module):
+
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
-        # The dead relu neuron problem, if the relu is 0, then there is no contribution 
-        # Smoothing out works better in reality 
-        self.gelu = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INT = 1
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.gelu    = nn.GELU(approximate='tanh')
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
-        return x 
+        return x
 
-# This is one round of attention and MLP 
 class Block(nn.Module):
+
     def __init__(self, config):
         super().__init__()
-        # Everything is pretty standard for an LLM
         self.ln_1 = nn.LayerNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
-    
+
     def forward(self, x):
-        # We normalize and add before every single attention block and MLP
-        # We add the results to itself in order to make backpropogation easier 
-        # This can go against the dissapearing gradient problem
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
-        return x 
-    
+        return x
 
-
-
-# This is the config dataclass, it defines the hyperparameters for GPT-2
-@dataclass 
+@dataclass
 class GPTConfig:
     block_size: int = 1024 # max sequence length
-    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 end of text token
+    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers
-    n_head: int = 12 # number of heads 
+    n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
 
-# This is the actual PyTorch module for GPT 
 class GPT(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         self.config = config
 
-        # Configure the transformer
-        # wte = weights of the token embedding
-        # wpe = weights of the position embedding
-        # h = hidden, this is a module list, indexed, n_layer blocks
-        # ln_f = a final layer normalization
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
-        # This is the final classifer, projects from 768 to vocab size,
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # weight sharing scheme (Used for better performance for similar semantics)
-        self.transformer.wte.weight = self.lm_head.weight
-        # this gets rid of a lot of parameters (30%)
 
-        # init params, this applies init weigth functions to all params
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            # this is the weight initialization
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
-                # we are multiplyign by 2 because we are passing the x 2 times in MLP and ATTn
-                std *=  (2* self.config.n_layer) ** -0.5
+                std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                # This is not the default in torch 
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        # idx is of shape (B,T)
+        # idx is of shape (B, T)
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of lenght {T}, block size is too big"
-        # forward the tokens and position embeddings 
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # this is to make sure that this list is stored on the device
-        pos_emb = self.transformer.wpe(pos)
-        tok_emb = self.transformer.wte(idx)
-
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+        # forward the token and posisition embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
         x = tok_emb + pos_emb
         # forward the blocks of the transformer
         for block in self.transformer.h:
             x = block(x)
-        # forward the final layernorm and the classifier 
+        # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x) # (B, T, vocab_size) 
-        # let's calculate and return the loss 
-        loss = None 
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
-        
-        return logits, loss 
-
-
-    # Classmethod makes it such that we do not need to initialize an instance of the class to use the function
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel # type: ignore
+        from transformers import GPT2LMHeadModel
         print("loading weights from pretrained gpt: %s" % model_type)
 
         # n_layer, n_head and n_embd are determined from model_type
@@ -209,22 +175,23 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-# --------------------------------------------------------------------------
-# prefix tokens
-import tiktoken # type: ignore
+
+# -----------------------------------------------------------------------------
+import tiktoken
 
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
         self.T = T
 
+        # at init load tokens from disk and store them in memory
         with open('input.txt', 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
         self.tokens = torch.tensor(tokens)
         print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B + T)} batches")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
         # state
         self.current_position = 0
@@ -232,110 +199,85 @@ class DataLoaderLite:
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        # Here is the sample code for the justification 
-        # buf = torch.tensor(tokens[:24+1])
-        # x = bug[:-1].view(4,6)
-        # y = buf[1:].view(4,6)
-        # Everything but the plus 1
-        x = (buf[:-1]).view(B,T)
-        # Everything except the first one 
-        y = (buf[1:]).view(B, T)
-        self.current_position += B *T
-        # if loading the next batch would be otu of bounds, reset 
-        if self.current_position + (B*T + 1) > len(self.tokens):
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
             self.current_position = 0
         return x, y
-        
 
-
-# --------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# attempt to autodetect the device
 import time
-# attempt to autodetect the device used 
-device = 'cpu'
+
+device = "cpu"
 if torch.cuda.is_available():
-    device = 'cuda'
+    device = "cuda"
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = 'mps' # this is for MACS
+    device = "mps"
 print(f"using device: {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-num_return_sequences = 5 
-max_length = 30
+train_loader = DataLoaderLite(B=16, T=1024)
 
-# Very important line here, this does not seem to be affecting my CPU
-# This may only affect GPUs !!!!!!!!!!!
 torch.set_float32_matmul_precision('high')
 
-# model = GPT.from_pretrained('gpt2')
-# Increased 
+# get logits
 model = GPT(GPTConfig(vocab_size=50304))
-# model.eval()
 model.to(device)
 model = torch.compile(model)
 
-train_loader = DataLoaderLite(B=4, T=32) # new GPT numbers 16, 1024
-
-# Learning Rate optimizations 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10 
-max_steps = 50 
-
+warmup_steps = 10
+max_steps = 50
 def get_lr(it):
-    # 1. Linear warmup for warmup_iters steps 
-    if it < warmup_steps: 
-        return max_lr * (it+1) / warmup_steps 
-    # 2 if it > lr_decay_iterns, return min learning rate 
-    if it > max_steps: 
-        return min_lr 
-    # else, decay the learning rate in a cosine matter 
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it > max_steps:
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
     assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff 
-    # starts at 1 and goes to 0 
-    return min_lr + coeff *(max_lr - min_lr)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
-# this learnign rate is a good rate 
+# optimize!
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-# Let's overfit to a single batch 
 for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
-    # always remember to 0 your gradient 
     optimizer.zero_grad()
-
-    # More time savings!!!!!!, using Bfloat16
     with torch.autocast(device_type=device, dtype=torch.bfloat16):
         logits, loss = model(x, y)
     loss.backward()
-    # Optimization 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-     # determine and set the learning rate for this iteration
+    # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-    # step updates the parameters to decrease the loss
     optimizer.step()
-    # usually, the 
-    # torch.cuda.synchronize()
+    torch.cuda.synchronize() # wait for the GPU to finish work
     t1 = time.time()
-    dt = (t1 - t0)*1000
-    # Let's add tokens per second which is a very important metric 
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 -  t0)
-    # when we call .item and ships it back to the cpu that is turned into a float 
+    dt = t1 - t0 # time difference in seconds
+    tokens_processed = train_loader.B * train_loader.T
+    tokens_per_sec = tokens_processed / dt
     print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
+import sys; sys.exit(0)
 
-
-
-# Let's skip the end for now
-import sys; sys.exit(0) 
-
-
+# prefix tokens
+model.eval()
+num_return_sequences = 5
+max_length = 30
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
