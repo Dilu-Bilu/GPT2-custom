@@ -1,1 +1,3 @@
 # GPT2-custom
+
+This repository entails me training from scrath a 124 million parameter GPT model along with the costs involved. Later, we try to finetune this model by using synthetic data generated from LLama 405B. This repository is primarily a learning excercize, and the much of the data and techniques for model training can be attributed to Andrej Karpathy's YouTube series. Finally, the dataset for finetuning the model was found frmo 
