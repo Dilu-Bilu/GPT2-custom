@@ -13,6 +13,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projeciton 
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INT = 1
         # regularization 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -50,6 +51,7 @@ class MLP(nn.Module):
         # Smoothing out works better in reality 
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4*config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -106,7 +108,27 @@ class GPT(nn.Module):
         ))
         # This is the final classifer, projects from 768 to vocab size,
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
+        # weight sharing scheme (Used for better performance for similar semantics)
+        self.transformer.wte.weight = self.lm_head.weight
+        # this gets rid of a lot of parameters (30%)
+
+        # init params, this applies init weigth functions to all params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # this is the weight initialization
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                # we are multiplyign by 2 because we are passing the x 2 times in MLP and ATTn
+                std *=  (2* self.config.n_layer) ** -0.5
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                # This is not the default in torch 
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx, targets=None):
         # idx is of shape (B,T)
         B, T = idx.size()
@@ -185,6 +207,39 @@ class GPT(nn.Module):
 # prefix tokens
 import tiktoken # type: ignore
 
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B + T)} batches")
+
+        # state
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        # Here is the sample code for the justification 
+        # buf = torch.tensor(tokens[:24+1])
+        # x = bug[:-1].view(4,6)
+        # y = buf[1:].view(4,6)
+        # Everything but the plus 1
+        x = (buf[:-1]).view(B,T)
+        # Everything except the first one 
+        y = (buf[1:]).view(B, T)
+        self.current_position += B *T
+        # if loading the next batch would be otu of bounds, reset 
+        if self.current_position + (B*T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+        
 
 
 # --------------------------------------------------------------------------
@@ -196,6 +251,9 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = 'mps' # this is for MACS
 print(f"using device: {device}")
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
 
 num_return_sequences = 5 
 max_length = 30
@@ -206,37 +264,13 @@ model = GPT(GPTConfig())
 model.to(device)
 
 
-
-# get a data batch 
-enc = tiktoken.get_encoding('gpt2')
-with open('input.txt', 'r') as f:
-    text = f.read()
-text = text[:1000]
-tokens = enc.encode(text)
-B, T = 4, 32
-# Creates the sequence for the tokens we want + 1
-buf = torch.tensor(tokens[:B*T + 1])
-# for tensors you have to make it go through the device 
-buf = buf.to(device)
-# Everything but the plus 1
-x = buf[:-1].view(B,T)
-# Everything except the first one 
-y = buf[1:].view(B, T)
-
-# Here is the sample code for the justification 
-# buf = torch.tensor(tokens[:24+1])
-# x = bug[:-1].view(4,6)
-# y = buf[1:].view(4,6)
-
-
-# get logits 
-# logits, loss = model(x, y)
-# print(loss)
-
+train_loader = DataLoaderLite(B=4, T=32)
 # this learnign rate is a good rate 
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 # Let's overfit to a single batch 
 for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
     # always remember to 0 your gradient 
     optimizer.zero_grad()
     logits, loss = model(x, y)
@@ -245,6 +279,10 @@ for i in range(50):
     optimizer.step()
     # when we call .item and ships it back to the cpu that is turned into a float 
     print(f"step {i}, loss {loss.item()}")
+
+
+
+
 
 # Let's skip the end for now
 import sys; sys.exit(0) 
