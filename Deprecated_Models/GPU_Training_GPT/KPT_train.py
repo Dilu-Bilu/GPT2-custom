@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import inspect
+
 # -----------------------------------------------------------------------------
 
 class CausalSelfAttention(nn.Module):
@@ -278,7 +279,7 @@ def get_lr(it):
     return min_lr + coeff * (max_lr - min_lr)
 
 # Batch accumulator (instaed of inreasing the batch size to 0.5M, we can simply do more passes and calculate losses at end)
-total_batch_size = 524288
+total_batch_size = 16 * 1024 * 2
 B = 16
 T = 1024
 assert total_batch_size % (B * T) == 0, "Make sure the total batch size is divisible by B * T"
