@@ -97,7 +97,7 @@ One of the key aspects of this project is understanding the computational cost i
 One of the key aspects of this project is understanding the computational cost involved.
 
 ### Cost Breakdown:
-| Expense | Cost (USD) |
+| Expense | Cost (CAD) |
 |---------|------------|
 | **Lambda Labs GPUs (8 × A100, 2.5 hours @ $20.50/hr)** | $51.25 |
 | **Hugging Face Fine-Tuning** | $2.00 |
